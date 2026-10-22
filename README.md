@@ -134,6 +134,10 @@ For protocol and live-test boundaries, including documented mixed tool behavior,
 
 Native Anthropic server tools, signed thinking, exact effort control, precise billing/cache accounting, and a guaranteed 1M context window are not supplied.
 
+## Known issues
+
+M365 account throttling can interrupt long agent sessions even when conversation reuse works. A confirmed gateway bug that consumed the execution timeout while requests waited in the queue has been fixed. See [Known issues](docs/known-issues.md) for the evidence, remaining cache/retry diagnostic gaps, and the limits of the current mitigations.
+
 ## Development
 
 ~~~powershell

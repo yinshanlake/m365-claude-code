@@ -46,4 +46,6 @@ The guard honors an upstream **Retry-After** value when present. If Microsoft su
 
 Use **Doctor.ps1** to read the current cooldown and **Doctor.ps1 -Recent** to inspect error codes, scopes, and attempted routes. Live diagnostic checks are skipped during a cooldown. The gateway sends HTTP 429 with **Retry-After** and **x-should-retry: false** for requests rejected before streaming. Clients may have additional retry behavior; their retries stay local while the guard is active.
 
+Queue wait no longer consumes the upstream execution budget. Both waits are bounded independently; private route logs report **queue_ms** and **upstream_ms**. This prevents a long queue from admitting an almost-expired request, cancelling a newly started M365 turn, and forcing another full-context request. It does not remove real upstream timeouts or account quotas. See [Known issues](known-issues.md) for the incident evidence and unresolved attribution limits.
+
 A cached or retained prefix still occupies context. The gateway therefore keeps estimating the full context for Claude Code's compaction decisions. Lowering that estimate to only the transmitted delta would hide context growth from the client. M365 does not expose enough information to certify a provider TPM limit, exact cache billing, or a guaranteed context window.

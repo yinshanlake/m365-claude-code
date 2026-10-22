@@ -87,11 +87,13 @@ function sendJson(response, status, body, headers = {}) {
 
 function createBridge(options) {
   if (!options.key) throw new Error('The local adapter credential is missing.');
+  const timeoutMs = options.timeoutMs || 240000;
+  const queueTimeoutMs = options.queueTimeoutMs || timeoutMs;
   const expectedKey = createHash('sha256').update(options.key).digest();
   const client = new OpenAI({
     baseURL: options.baseURL || 'http://127.0.0.1:4144/v1',
     apiKey: options.upstreamKey || 'not-needed', maxRetries: 0,
-    timeout: options.timeoutMs || 240000,
+    timeout: timeoutMs,
   });
   const acquire = sequentialGate();
   const trace = options.trace || (() => {});
@@ -102,7 +104,8 @@ function createBridge(options) {
     const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
     if ((pathname === '/' || pathname === '/health') && ['GET', 'HEAD'].includes(request.method)) {
       sendJson(response, 200, { status: 'ok', adapter: 'm365-anthropic', protocol: 'anthropic-messages',
-        fallback_enabled: fallbacks.length > 0, fallback_order: fallbacks, account_throttle: throttle.snapshot() });
+        fallback_enabled: fallbacks.length > 0, fallback_order: fallbacks, account_throttle: throttle.snapshot(),
+        queue_timeout_ms: queueTimeoutMs, upstream_timeout_ms: timeoutMs });
       return;
     }
     const suppliedKey = request.headers.authorization?.replace(/^Bearer /i, '') || request.headers['x-api-key'] || '';
@@ -113,7 +116,7 @@ function createBridge(options) {
     }
     const requestId = randomUUID();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(problem('M365 request timed out.', 504, 'api_error')), options.timeoutMs || 240000);
+    let timeout = setTimeout(() => controller.abort(problem('Local gateway queue timed out before an upstream request could start.', 504, 'api_error')), queueTimeoutMs);
     const onAbort = () => controller.abort(problem('Client disconnected.', 499, 'api_error'));
     request.on('aborted', onAbort);
     response.on('close', () => { if (!response.writableEnded) onAbort(); });
@@ -123,8 +126,15 @@ function createBridge(options) {
     let clientModel;
     let observedModel;
     let observedUsage;
+    let queuedAt;
+    let acquiredAt;
     const attemptedRoutes = [];
     const startedAt = Date.now();
+    const timing = () => ({
+      elapsed_ms: Date.now() - startedAt,
+      queue_ms: queuedAt === undefined ? 0 : (acquiredAt ?? Date.now()) - queuedAt,
+      upstream_ms: acquiredAt === undefined ? 0 : Date.now() - acquiredAt,
+    });
     try {
       if (request.method === 'GET' && pathname === '/v1/models') {
         const data = catalog.models.map(modelInfo);
@@ -172,7 +182,14 @@ function createBridge(options) {
           if (!response.destroyed && !response.writableEnded) response.write('event: ping\ndata: {"type":"ping"}\n\n');
         }, 15000);
       }
+      queuedAt = Date.now();
       release = await acquire(controller.signal);
+      acquiredAt = Date.now();
+      clearTimeout(timeout);
+      // A request that waited behind another client still needs its full
+      // execution budget. Otherwise a nearly expired queue wait starts a turn
+      // only to cancel it and force a client retry with fresh M365 context.
+      timeout = setTimeout(() => controller.abort(problem('M365 request timed out.', 504, 'api_error')), timeoutMs);
       throttle.assertAvailable();
       let result;
       for (let index = 0; index < candidates.length; index++) {
@@ -229,7 +246,7 @@ function createBridge(options) {
       }
       trace({ event: 'complete', request_id: requestId, upstream_model: route, response_model: observedModel,
         requested_model: preferredRoute, attempted_models: attemptedRoutes, fallback_used: route !== preferredRoute,
-        stop_reason: final.stop_reason, usage: final.usage, ...upstreamDiagnostics(observedUsage), elapsed_ms: Date.now() - startedAt });
+        stop_reason: final.stop_reason, usage: final.usage, ...upstreamDiagnostics(observedUsage), ...timing() });
     } catch (caught) {
       const error = controller.signal.aborted ? controller.signal.reason : caught;
       throttle.observe(error);
@@ -240,7 +257,7 @@ function createBridge(options) {
         ...(status === 400 ? { validation_message: body.error.message } : {}),
         attempted_models: attemptedRoutes, ...errorMetadata(error),
         ...(accountThrottle ? { account_throttle: accountThrottle, sent_upstream: attemptedRoutes.length > 0 } : {}),
-        error_type: body.error.type, elapsed_ms: Date.now() - startedAt });
+        error_type: body.error.type, ...timing() });
       if (!response.destroyed && !response.writableEnded) {
         if (response.headersSent) response.end('event: error\ndata: ' + JSON.stringify(body) + '\n\n');
         else {
@@ -284,6 +301,7 @@ if (require.main === module) {
       baseURL: process.env.M365_OPENAI_BASE_URL || config.upstreamBaseUrl || 'http://127.0.0.1:4144/v1',
       upstreamKey: process.env.M365_UPSTREAM_API_KEY || readSecret('upstream-key.txt'),
       timeoutMs: config.timeoutMs || 240000,
+      queueTimeoutMs: config.queueTimeoutMs,
       fallbackModels: config.fallbackEnabled === false ? [] : catalog.fallbackOrder,
       accountThrottleCooldownMs: config.accountThrottleCooldownMs,
       throttleState,

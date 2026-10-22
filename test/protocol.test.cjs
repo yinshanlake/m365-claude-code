@@ -570,6 +570,46 @@ test('request timeout returns an error and cancels the upstream', async t => {
   assert.match((await res.json()).error.message, /timed out/);
 });
 
+test('time spent queued does not consume the next request execution budget', async t => {
+  let count = 0;
+  const f = await fixture(t, async (body, res) => {
+    const index = ++count;
+    await new Promise(resolve => setTimeout(resolve, index === 1 ? 300 : 250));
+    sse(res, [chunk({ content: 'READY' }), chunk({}, 'stop')]);
+  }, { timeoutMs: 400 });
+  const first = await f.post({ ...base, stream: true });
+  const second = await f.post({ ...base, stream: true });
+  const [one, two] = await Promise.all([first.text(), second.text()]);
+  assert.match(one, /READY/);
+  assert.match(two, /READY/);
+  assert.equal(two.includes('event: error'), false);
+  assert.equal(f.seen.length, 2);
+  const completed = f.traces.filter(event => event.event === 'complete');
+  assert.equal(completed.length, 2);
+  assert.ok(completed[1].elapsed_ms > 400);
+  assert.ok(completed[1].queue_ms >= 200);
+  assert.ok(completed[1].upstream_ms >= 200);
+});
+
+test('a queue timeout rejects the waiting client without starting an upstream turn', async t => {
+  let started;
+  const running = new Promise(resolve => { started = resolve; });
+  let firstResponse;
+  const f = await fixture(t, (_body, res) => { firstResponse = res; started(); },
+    { timeoutMs: 1000, queueTimeoutMs: 80 });
+  const first = f.post(base);
+  await running;
+  const second = await f.post(base);
+  assert.equal(second.status, 504);
+  assert.match((await second.json()).error.message, /queue timed out/);
+  assert.equal(f.seen.length, 1);
+  const error = f.traces.find(event => event.event === 'error');
+  assert.deepEqual(error.attempted_models, []);
+  assert.equal(error.upstream_ms, 0);
+  json(firstResponse, completion(base.model));
+  assert.equal((await first).status, 200);
+});
+
 test('concurrent client requests are serialized and cancelling a queued request skips it', async t => {
   let finishFirst;
   const firstStarted = new Promise(resolve => { finishFirst = resolve; });

@@ -26,7 +26,7 @@ The upstream patch namespaces conversation fingerprints by an opaque client sess
 
 ## Validation
 
-The extracted protocol suite contains 38 tests, including real local HTTP exchanges with the Anthropic SDK. It covers routing, interleaved system messages, model mismatch, parallel tool calls, deferred schemas, JSON output, errors, cancellation, timeouts, queued requests, context/cache telemetry, ordered fallback, shared account cooldowns, restored cooldown state, expiry, and privacy-preserving error metadata. Launcher checks cover native argument forwarding, connection-setting precedence, retained user permissions, and PowerShell syntax.
+The extracted protocol suite contains 40 tests, including real local HTTP exchanges with the Anthropic SDK. It covers routing, interleaved system messages, model mismatch, parallel tool calls, deferred schemas, JSON output, errors, cancellation, separate queue and execution timeouts, queued requests, context/cache telemetry, ordered fallback, shared account cooldowns, restored cooldown state, expiry, and privacy-preserving error metadata. Launcher checks cover native argument forwarding, connection-setting precedence, retained user permissions, and PowerShell syntax.
 
 A native Claude Code fixture with an active cooldown made one gateway request and exited with a clear HTTP 429 cooldown message in about one second. It made zero requests to the fixture upstream. This verifies the client's handling of the local hold response without consuming M365 turns or assuming that Microsoft has lifted an account throttle.
 
@@ -43,6 +43,8 @@ A copied native session that previously failed after switching to Sonnet 5 passe
 Live behavior was mixed: one Sonnet run refused the full tool description, and GPT/Opus runs sometimes repeated work or chose an unrelated tool. A focused MCP task also failed to call its requested tool in one run. Connection success and a successful chat response are not full-agent reliability guarantees.
 
 No personal transcripts, credentials, or organization-specific MCP settings are included as evidence.
+
+The [account-throttle investigation](known-issues.md) distinguishes the Microsoft rejection from confirmed gateway amplification and remaining diagnostic gaps. One captured request spent about 227 seconds queued and only about 13 seconds executing before the old shared deadline expired. The regression fixture now verifies that queued requests receive a full execution budget, while an expired queue wait makes no upstream request.
 
 ## Boundaries
 
