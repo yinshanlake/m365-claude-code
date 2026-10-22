@@ -7,16 +7,19 @@ const { randomUUID, createHash, timingSafeEqual } = require('node:crypto');
 const OpenAI = require('openai');
 const { catalog, resolveModel } = require('./route.cjs');
 const { problem, convertRequest, estimateInput, upstreamDiagnostics, assertResponseModel, responseMessage, streamMessage } = require('./protocol.cjs');
-const { errorStatus, canFallback, prepareStream } = require('./upstream.cjs');
+const { errorStatus, errorMetadata, canFallback, prepareStream } = require('./upstream.cjs');
+const { createAccountThrottle } = require('./throttle.cjs');
 
 function errorInfo(error) {
   const status = error.name === 'AbortError' ? 504 : errorStatus(error);
   const types = { 400: 'invalid_request_error', 401: 'authentication_error', 403: 'permission_error',
     404: 'not_found_error', 408: 'api_error', 413: 'request_too_large', 429: 'rate_limit_error' };
   const knownTypes = new Set([...Object.values(types), 'overloaded_error']);
+  const metadata = errorMetadata(error);
   return { status, body: { type: 'error', error: {
     type: knownTypes.has(error.type) ? error.type : types[status] || 'api_error',
     message: String(error.error?.message || error.message || 'Upstream request failed.').slice(0, 2000),
+    ...(metadata.error_code ? { code: metadata.error_code } : {}),
   } } };
 }
 
@@ -93,11 +96,13 @@ function createBridge(options) {
   const acquire = sequentialGate();
   const trace = options.trace || (() => {});
   const fallbacks = [...new Set((options.fallbackModels || []).map(resolveModel))];
+  const throttle = createAccountThrottle({ cooldownMs: options.accountThrottleCooldownMs,
+    initialState: options.throttleState, onChange: options.onThrottleStateChange, now: options.now });
   return http.createServer(async (request, response) => {
     const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
     if ((pathname === '/' || pathname === '/health') && ['GET', 'HEAD'].includes(request.method)) {
       sendJson(response, 200, { status: 'ok', adapter: 'm365-anthropic', protocol: 'anthropic-messages',
-        fallback_enabled: fallbacks.length > 0, fallback_order: fallbacks });
+        fallback_enabled: fallbacks.length > 0, fallback_order: fallbacks, account_throttle: throttle.snapshot() });
       return;
     }
     const suppliedKey = request.headers.authorization?.replace(/^Bearer /i, '') || request.headers['x-api-key'] || '';
@@ -154,6 +159,7 @@ function createBridge(options) {
         unsupported_server_tools: unsupportedTools, input_tokens_estimate: inputEstimate,
         structured_output: Boolean(outputFormat),
         legacy_model_header_ignored: Boolean(request.headers['x-m365-model']) });
+      throttle.assertAvailable();
       const preferredRoute = route;
       const candidates = [preferredRoute, ...(request.headers['x-m365-fallback'] === 'off' ? [] : fallbacks.filter(model => model !== preferredRoute))];
       const headers = { 'request-id': requestId, 'x-m365-requested-model': preferredRoute, 'x-m365-usage': 'local-estimate' };
@@ -167,6 +173,7 @@ function createBridge(options) {
         }, 15000);
       }
       release = await acquire(controller.signal);
+      throttle.assertAvailable();
       let result;
       for (let index = 0; index < candidates.length; index++) {
         controller.signal.throwIfAborted();
@@ -225,18 +232,22 @@ function createBridge(options) {
         stop_reason: final.stop_reason, usage: final.usage, ...upstreamDiagnostics(observedUsage), elapsed_ms: Date.now() - startedAt });
     } catch (caught) {
       const error = controller.signal.aborted ? controller.signal.reason : caught;
+      throttle.observe(error);
+      const accountThrottle = throttle.snapshot();
       const { status, body } = errorInfo(error);
       trace({ event: status === 499 ? 'cancelled' : 'error', request_id: requestId,
         endpoint: pathname, client_model: clientModel, upstream_model: route, response_model: observedModel, status,
         ...(status === 400 ? { validation_message: body.error.message } : {}),
-        attempted_models: attemptedRoutes,
+        attempted_models: attemptedRoutes, ...errorMetadata(error),
+        ...(accountThrottle ? { account_throttle: accountThrottle, sent_upstream: attemptedRoutes.length > 0 } : {}),
         error_type: body.error.type, elapsed_ms: Date.now() - startedAt });
       if (!response.destroyed && !response.writableEnded) {
         if (response.headersSent) response.end('event: error\ndata: ' + JSON.stringify(body) + '\n\n');
         else {
-          const retryAfter = error.headers?.get?.('retry-after');
+          const retryAfter = status === 429 && accountThrottle ? String(accountThrottle.retry_after_seconds) : error.headers?.get?.('retry-after');
           sendJson(response, status === 499 ? 408 : status, body, {
             'request-id': requestId, ...(retryAfter ? { 'retry-after': retryAfter } : {}),
+            ...(status === 429 && accountThrottle ? { 'x-should-retry': 'false' } : {}),
           });
         }
       }
@@ -264,12 +275,24 @@ if (require.main === module) {
     const logDir = path.join(dataDir, 'logs');
     const traceFile = path.join(logDir, 'routes-' + new Date().toISOString().slice(0, 10) + '.jsonl');
     fs.mkdirSync(logDir, { recursive: true });
+    const throttleFile = path.join(dataDir, 'account-throttle.json');
+    let throttleState;
+    try { if (fs.existsSync(throttleFile)) throttleState = JSON.parse(fs.readFileSync(throttleFile, 'utf8')); }
+    catch { process.stderr.write('Could not read local account throttle state.\n'); }
     const server = createBridge({
       key: process.env.M365_CLAUDE_KEY || readSecret('gateway-key.txt'),
       baseURL: process.env.M365_OPENAI_BASE_URL || config.upstreamBaseUrl || 'http://127.0.0.1:4144/v1',
       upstreamKey: process.env.M365_UPSTREAM_API_KEY || readSecret('upstream-key.txt'),
       timeoutMs: config.timeoutMs || 240000,
       fallbackModels: config.fallbackEnabled === false ? [] : catalog.fallbackOrder,
+      accountThrottleCooldownMs: config.accountThrottleCooldownMs,
+      throttleState,
+      onThrottleStateChange: state => {
+        try {
+          fs.writeFileSync(throttleFile + '.tmp', JSON.stringify(state) + '\n');
+          fs.renameSync(throttleFile + '.tmp', throttleFile);
+        } catch { process.stderr.write('Could not save local account throttle state.\n'); }
+      },
       trace: event => {
         try { fs.appendFileSync(traceFile, JSON.stringify({ time: new Date().toISOString(), ...event }) + '\n'); }
         catch { process.stderr.write('Could not write local route metadata.\n'); }

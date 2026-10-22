@@ -7,6 +7,22 @@ function errorStatus(error) {
   return error.statusCode || error.status || statuses[detail.type] || 502;
 }
 
+function errorMetadata(error) {
+  const detail = error.error?.error || error.error || error;
+  const metadata = {};
+  const codes = ['priority_access_exhausted', 'model_route_unavailable', 'model_not_found',
+    'model_not_supported', 'm365_throttled', 'm365_throttle_hold', 'm365_turn_budget'];
+  if (codes.includes(detail.code)) metadata.error_code = detail.code;
+  if (['PerUserThrottled', 'PerTenantThrottled', 'PerConversationThrottled', 'day', 'week'].includes(detail.param)) {
+    metadata.error_scope = detail.param;
+  }
+  const limit = /^M365 Copilot rate limited \((\d+)\/(\d+) messages used\)/.exec(detail.message || '');
+  if (limit) metadata.upstream_rate_limit = { current: Number(limit[1]), max: Number(limit[2]) };
+  const retryAfter = error.headers?.get?.('retry-after');
+  if (typeof retryAfter === 'string' && /^\d+$/.test(retryAfter)) metadata.retry_after_seconds = Number(retryAfter);
+  return metadata;
+}
+
 function streamError(error) {
   const statusCode = errorStatus(error);
   return Object.assign(new Error(error.message || 'Upstream stream failed.'), {
@@ -58,4 +74,4 @@ async function prepareStream(stream, observeChunk) {
   }
 }
 
-module.exports = { errorStatus, streamError, canFallback, prepareStream };
+module.exports = { errorStatus, errorMetadata, streamError, canFallback, prepareStream };

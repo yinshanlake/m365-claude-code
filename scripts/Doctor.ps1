@@ -11,9 +11,11 @@ if ($Recent) {
     if (-not $log) { throw 'No gateway route log is available yet.' }
     Get-Content -LiteralPath $log.FullName -Tail 1000 | ForEach-Object {
         $entry = $_ | ConvertFrom-Json
-        if ($entry.event -eq 'complete') {
-            [pscustomobject]@{ Time = $entry.time; Requested = $entry.requested_model;
-                Actual = $entry.upstream_model; Fallback = $entry.fallback_used;
+        if ($entry.event -in @('complete', 'error', 'cancelled')) {
+            [pscustomobject]@{ Time = $entry.time; Result = $entry.event;
+                Requested = ($entry.requested_model ?? $entry.client_model);
+                Route = $entry.upstream_model;
+                Error = (@($entry.status, $entry.error_code, $entry.error_scope) | Where-Object { $null -ne $_ }) -join ' ';
                 Attempted = ($entry.attempted_models -join ', ') }
         }
     } | Select-Object -Last 8 | Format-Table -Wrap
@@ -27,6 +29,14 @@ $health = Invoke-RestMethod -Uri ($baseUrl + '/health') -TimeoutSec 5
 if ($health.status -ne 'ok') { throw 'The gateway health check failed.' }
 $catalog = Invoke-RestMethod -Uri ($baseUrl + '/v1/models') -Headers $headers -TimeoutSec 5
 Write-Output ('Gateway ready; configured routes: ' + ($catalog.data.id -join ', '))
+if ($health.account_throttle) {
+    $retryAt = [DateTimeOffset]::Parse($health.account_throttle.retry_at).ToLocalTime()
+    Write-Warning ('M365 inference is paused: ' + $health.account_throttle.code + '. Gateway retry time: ' + $retryAt.ToString('yyyy-MM-dd HH:mm:ss zzz'))
+    if ($health.account_throttle.basis -eq 'local_policy') {
+        Write-Output 'This is a local cooldown. Microsoft did not provide a reset time.'
+    }
+    if ($Live -or $CheckContext) { throw 'Inference checks were skipped during the account cooldown.' }
+}
 
 $upstreamHeaders = @{}
 $upstreamKeyPath = Join-Path $dataDir 'upstream-key.txt'

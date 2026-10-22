@@ -377,6 +377,101 @@ test('invalid requests, authentication failures, and account throttles do not fa
   }
 });
 
+test('rate-limit metadata identifies the failure without logging the error payload', async t => {
+  for (const stream of [false, true]) {
+    const f = await fixture(t, (_body, res) => json(res, { error: {
+      message: 'Fixture private error payload.', type: 'rate_limit_error', code: 'm365_throttled', param: 'PerUserThrottled',
+    } }, 429, { 'retry-after': '30' }));
+    await (await f.post({ ...base, stream })).text();
+    const event = f.traces.find(entry => entry.event === 'error');
+    assert.equal(event.error_code, 'm365_throttled');
+    assert.equal(event.error_scope, 'PerUserThrottled');
+    assert.equal(event.retry_after_seconds, 30);
+    assert.equal(JSON.stringify(f.traces).includes('Fixture private error payload.'), false);
+  }
+});
+
+test('an account throttle blocks other clients and models without sending another request', async t => {
+  const f = await fixture(t, (_body, res) => json(res, { error: {
+    message: 'Fixture account throttle.', type: 'rate_limit_error', code: 'm365_throttled', param: 'PerUserThrottled',
+  } }, 429), { fallbackModels: route.catalog.fallbackOrder });
+  assert.equal((await f.post({ ...base, metadata: { user_id: 'first-client' } })).status, 429);
+  const blocked = await f.post({ ...base, model: 'gpt-5.5-think-deeper', stream: true, metadata: { user_id: 'second-client' } });
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.headers.get('x-should-retry'), 'false');
+  assert.ok(Number(blocked.headers.get('retry-after')) > 4400);
+  const error = (await blocked.json()).error;
+  assert.equal(error.code, 'm365_throttle_hold');
+  assert.match(error.message, /not sent upstream/);
+  assert.match(error.message, /Microsoft did not provide a reset time/);
+  assert.equal(f.seen.length, 1);
+  const health = await (await fetch(f.url + '/health')).json();
+  assert.equal(health.account_throttle.scope, 'PerUserThrottled');
+  assert.equal(health.account_throttle.basis, 'local_policy');
+  assert.deepEqual(f.traces.at(-1).attempted_models, []);
+  assert.equal(f.traces.at(-1).sent_upstream, false);
+});
+
+test('requests already queued when throttling starts are rejected without another upstream turn', async t => {
+  let release;
+  const wait = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, async (_body, res) => {
+    await wait;
+    json(res, { error: { message: 'Fixture account throttle.', type: 'rate_limit_error', code: 'm365_throttled' } }, 429);
+  });
+  const first = await f.post({ ...base, stream: true });
+  const second = await f.post({ ...base, stream: true });
+  release();
+  const [one, two] = await Promise.all([first.text(), second.text()]);
+  assert.match(one, /m365_throttled/);
+  assert.match(two, /m365_throttle_hold/);
+  assert.equal(two.includes('event: message_start'), false);
+  assert.equal(f.seen.length, 1);
+});
+
+test('cooldown survives gateway replacement and expires without being extended by client retries', async t => {
+  let time = Date.parse('2026-01-01T00:00:00Z');
+  let saved;
+  const f = await fixture(t, (_body, res) => json(res, { error: {
+    message: 'Fixture account throttle.', type: 'rate_limit_error', code: 'm365_throttled',
+  } }, 429, { 'retry-after': '10' }), { now: () => time, onThrottleStateChange: state => { saved = state; } });
+  await (await f.post(base)).json();
+  assert.equal(saved.basis, 'upstream_retry_after');
+  const restored = await fixture(t, (body, res) => json(res, completion(body.model)),
+    { now: () => time, throttleState: saved });
+  time += 5000;
+  const blocked = await restored.post(base);
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.headers.get('retry-after'), '5');
+  assert.equal(restored.seen.length, 0);
+  time += 5001;
+  assert.equal((await restored.post(base)).status, 200);
+  assert.equal(restored.seen.length, 1);
+});
+
+test('an in-stream account throttle preserves its retry delay for the next request', async t => {
+  const f = await fixture(t, (_body, res) => sse(res, [{ error: {
+    message: 'Fixture account throttle.', type: 'rate_limit_error', code: 'm365_throttled', retry_after: 60,
+  } }]), { now: () => 0 });
+  assert.match(await (await f.post({ ...base, stream: true })).text(), /m365_throttled/);
+  const blocked = await f.post(base);
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.headers.get('retry-after'), '60');
+  assert.equal(f.seen.length, 1);
+});
+
+test('model-specific quotas and unclassified rate limits do not block the whole account', async t => {
+  for (const [code, param] of [['priority_access_exhausted'], [], ['m365_throttled', 'PerConversationThrottled']]) {
+    const f = await fixture(t, (_body, res) => json(res, { error: {
+      message: 'Fixture limited route.', type: 'rate_limit_error', code, param,
+    } }, 429));
+    await (await f.post(base)).json();
+    await (await f.post(base)).json();
+    assert.equal(f.seen.length, 2);
+    assert.equal((await (await fetch(f.url + '/health')).json()).account_throttle, null);
+  }
+});
+
 test('streaming can change route before content without emitting a false model start', async t => {
   const f = await fixture(t, (body, res) => body.model === 'claude-opus'
     ? sse(res, [{ ...chunk({ role: 'assistant' }), model: body.model },

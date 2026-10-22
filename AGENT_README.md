@@ -46,6 +46,8 @@ pwsh -NoProfile -File .\scripts\Doctor.ps1 -Recent
 
 The context check makes two inference requests; use it to verify real conversation reuse, not provider prompt-cache billing. Also exercise an interactive session: open **/model**, select a configured route, and make a request. Inspect the actual response model and private route metadata, including fallback attempts. The picker displays the preferred route. Do not use the model's self-description as proof.
 
+If health reports account_throttle, stop live checks and report the local retry time. Switching models or opening sessions does not clear an account throttle. Do not delete the persisted cooldown or restart services to bypass it. A cooldown without an upstream Retry-After is a local policy, not a promise that Microsoft will resume service at that time. Doctor's recent view includes error codes and scopes without exposing raw error payloads.
+
 For an agent check, create a scratch directory under .local/, with a random nonce and numbers in an input file. Ask Claude Code to read the file, write the nonce and sum to a result file, and run a local verification script. Check the actual file and command output. A prose claim that a task is done is not sufficient.
 
 If the backend refuses, repeats work, or chooses an unrelated tool, report that limitation. Do not silently substitute another model or claim full compatibility. Smaller toolsets can be tested using **-BuiltInTools**; label those results accordingly.
