@@ -111,15 +111,19 @@ pwsh -NoProfile -File .\scripts\Setup.ps1 -UpstreamBaseUrl http://127.0.0.1:4144
 
 If that upstream requires an API key, place it in **.local/upstream-key.txt**. External backend processes are not managed by this repository. Their model catalog must match the routes you configure.
 
-## What the gateway handles
+## Tool calls and context reuse
 
-- Explicit model routing, model discovery, and local bearer authentication.
-- Tool-call IDs, parallel results, images, deferred tool schemas, and safe handling of incomplete history.
-- Anthropic streaming events, valid JSON arguments, correct stop reasons, errors, cancellation, and timeouts.
-- Locally validated JSON-schema output and estimated token counts for client context management.
-- Separate M365 conversation state per client session, with serialized requests to respect the upstream's concurrency limits.
+These are separate capabilities; passing a protocol test does not prove an agent task will succeed end to end.
 
-Native Anthropic server tools, signed thinking, exact effort control, precise billing/cache accounting, and a guaranteed 1M context window are not supplied. See [compatibility details](docs/compatibility.md).
+| Capability | What this repository does | How to verify / limitation |
+| --- | --- | --- |
+| Tool-call protocol | Converts Anthropic tool calls and results, retaining IDs and parallel results; handles streamed arguments, images, and deferred tool schemas. Claude Code—not this gateway—executes tools and applies its native permissions. | `npm test` exercises local HTTP and Anthropic SDK exchanges with fixture responses. The M365 backend reconstructs tool calls from generated text, so tool selection and execution remain model-dependent. Use the real file-and-command check in [AGENT_README.md](AGENT_README.md) for an end-to-end check. |
+| M365 conversation reuse | Keeps per-client conversations separate and, when the submitted history still matches, reuses M365 context by sending only the new-message delta. | `pwsh -NoProfile -File .\scripts\Doctor.ps1 -CheckContext -Model claude-sonnet` makes two live inference requests and checks recall of a random first-turn value, the same conversation, and delta mode. These requests consume M365 turns. Reuse is conservative; model changes, rewritten history, uncertain failures, idle eviction, or process restarts require fresh context. |
+| Provider prompt cache | Does not claim or estimate provider cache hits. | The pinned upstream does not expose Anthropic prompt-cache counters or cache-control behavior. Unknown counters remain unreported; local token estimates are for client context management, not billing. See [context reuse and quotas](docs/context-reuse.md). |
+
+For protocol and live-test boundaries, including documented mixed tool behavior, see [compatibility details](docs/compatibility.md).
+
+Native Anthropic server tools, signed thinking, exact effort control, precise billing/cache accounting, and a guaranteed 1M context window are not supplied.
 
 ## Development
 

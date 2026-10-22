@@ -268,7 +268,7 @@ test('the Anthropic SDK consumes real HTTP text and parallel tool SSE responses'
     ] }), model: body.model },
     { ...chunk({}, 'tool_calls'), model: body.model },
   ]));
-  const client = new Anthropic({ apiKey: 'local-test-only', baseURL: f.url, maxRetries: 0 });
+  const client = new Anthropic({ apiKey: 'local-test-only', authToken: null, baseURL: f.url, maxRetries: 0 });
   const answer = await client.messages.stream({ ...base, tools: [tool('Read')] }).finalMessage();
   assert.equal(answer.stop_reason, 'tool_use');
   assert.deepEqual(answer.content.filter(block => block.type === 'tool_use').map(block => [block.id, block.input.value]), [['one', 'a'], ['two', 'b']]);
@@ -311,7 +311,7 @@ test('context telemetry survives JSON and SSE without copying arbitrary upstream
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('x-m365-provider-cache'), 'unreported');
   assert.deepEqual(JSON.parse(response.headers.get('x-m365-context')), context);
-  const client = new Anthropic({ apiKey: 'local-test-only', baseURL: f.url, maxRetries: 0 });
+  const client = new Anthropic({ apiKey: 'local-test-only', authToken: null, baseURL: f.url, maxRetries: 0 });
   const streamed = await client.messages.stream(base).finalMessage();
   assert.equal(streamed.usage.cache_read_input_tokens, 0);
   const traces = f.traces.filter(event => event.event === 'complete');
