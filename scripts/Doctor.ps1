@@ -30,7 +30,7 @@ if ($health.status -ne 'ok') { throw 'The gateway health check failed.' }
 $catalog = Invoke-RestMethod -Uri ($baseUrl + '/v1/models') -Headers $headers -TimeoutSec 5
 Write-Output ('Gateway ready; configured routes: ' + ($catalog.data.id -join ', '))
 if ($health.account_throttle) {
-    $retryAt = [DateTimeOffset]::Parse($health.account_throttle.retry_at).ToLocalTime()
+    $retryAt = ([DateTimeOffset]$health.account_throttle.retry_at).ToLocalTime()
     Write-Warning ('M365 inference is paused: ' + $health.account_throttle.code + '. Gateway retry time: ' + $retryAt.ToString('yyyy-MM-dd HH:mm:ss zzz'))
     if ($health.account_throttle.basis -eq 'local_policy') {
         Write-Output 'This is a local cooldown. Microsoft did not provide a reset time.'
