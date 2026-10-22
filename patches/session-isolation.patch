@@ -1,0 +1,458 @@
+diff --git a/docs/hypotheses.md b/docs/hypotheses.md
+index 04e3a18..ec3e2cd 100644
+--- a/docs/hypotheses.md
++++ b/docs/hypotheses.md
+@@ -5640,3 +5640,20 @@ bursty. Falsifier: fresh-conversation retries failing at the same rate as same-c
+ Cost to watch: each such retry starts a conversation, which is what the F13 thread-rate throttle
+ counts. Bounded to one per dropped turn, but on a bad `InternalError` day it adds up; the same
+ afternoon's benching (one conversation per run) did trip `PerUserThrottled`.
++
++## Scoped client context reuse (2026-10-22)
++
++Hypothesis: keying an explicitly identified client session by all current tool
++names unnecessarily replays history when Claude Code discovers another tool.
++Falsifier: a changing tool set already retains the same ModelSession and sends a
++delta. The existing code and regression fixture instead start another session.
++
++The scoped-session patch separates tool-less helpers, verifies the submitted
++message prefix, and sends tool-configuration updates with new messages. Five
++regression cases cover discovery, rewritten history, helpers, failures, and model
++changes; the 81 related tests pass. Newly appended system reminders are preserved.
++A two-turn live Sonnet check through the Anthropic gateway retained the same
++hashed conversation ID and recalled a random first-turn code; submitted text was
++180 then 71 characters, with one handler attempt each. This sample establishes
++transport reuse, not provider prompt-cache hits or model-compliance improvements.
++M365's provider cache counters remain unreported. See API section 8 for telemetry.
+diff --git a/docs/m365-copilot-api.md b/docs/m365-copilot-api.md
+index b2d976a..70c59d0 100644
+--- a/docs/m365-copilot-api.md
++++ b/docs/m365-copilot-api.md
+@@ -450,6 +450,28 @@ conversation at `1/600`). Characterised behaviour:
+ 
+ ## 8. Conversations & sessions
+ 
++The OpenAI-compatible endpoint accepts an optional opaque session identifier in
++the request's standard user field. SessionPool includes it in the conversation
++fingerprint, preventing separate CLI sessions with identical opening messages
++and tool sets from sharing M365 state. Clients that omit it retain the legacy
++opener/tool-set behavior. The Claude Code adapter hashes its client session
++metadata before supplying this field. With an explicit identifier, tool-bearing
++requests keep their conversation when ToolSearch expands the tool set. Tool-less
++helpers use a separate namespace. A changed tool configuration is sent with the
++next delta, without replaying old messages.
++
++The pool verifies the previously submitted message prefix before reusing it.
++Rewritten or compacted history, a model change, a failed or cancelled turn, or
++idle eviction requires fresh context. Newly appended system messages are kept
++in the delta with the same rendering used for the initial request.
++
++The usage extension x_m365_context reports the initial full/delta mode,
++conversation reuse, a hashed conversation ID, reused message count, characters
++submitted to ModelSession.run, handler attempt count, and tool-configuration
++updates. These are local transport diagnostics, not provider token accounting;
++provider_prompt_cache remains unreported. Internal reconnects inside
++ModelSession.run are not counted as separate handler attempts.
++
+ - A "conversation" = a stable `ConversationId` (+ `X-SessionId`). M365 keeps **server-side context** for it.
+ - Each **turn opens a fresh WebSocket** (with `invocationId:"0"`), but reuses the same `ConversationId`/`sessionId`, so the server threads them together. `isStartOfSession:true` only on turn 0.
+ - **Send `X-RoutingParameter-SessionKey: <ConversationId>` as a header on every upgrade.** Without it the front end spreads a conversation's connections over backends in two regions (`x-calculatedbetarget` in the upgrade response names the one you got), which keep separate copies of the conversation: the turns fork, the server's `turnCount` steps back (1,2,3,2,4,…), and the model answers from a partial history. The query-string form does not pin. See hypotheses §32 F85 and `scripts/fork-probe.mjs`.
+diff --git a/packages/proxy-lib/src/handler.ts b/packages/proxy-lib/src/handler.ts
+index f387c51..7f243f7 100644
+--- a/packages/proxy-lib/src/handler.ts
++++ b/packages/proxy-lib/src/handler.ts
+@@ -1,3 +1,4 @@
++import { createHash } from "node:crypto";
+ import {
+   ModelSession,
+   type ModelSessionOptions,
+@@ -146,6 +147,9 @@ type ParsedMessage = ChatBody["messages"][number];
+ interface ConversationState {
+   session: ModelSession;
+   sentMessageCount: number;
++  sentPrefixHash?: string;
++  sentToolsKey?: string;
++  contextUncertain?: boolean;
+   lastAccessedAt: number;
+   /** Sent ahead of the next tool result when the proxy executed less than the
+    *  model wrote last turn (see executedOnlyFirstNote). */
+@@ -200,12 +204,12 @@ export class SessionPool {
+   /**
+    * Resolve the conversation state for an incoming request.
+    * Fingerprint is the hash of the first user message and the request's tool
+-   * names — same opener and same tool set = same conversation.
++   * names, scoped to an optional client session identifier.
+    */
+-  resolve(messages: ParsedMessage[], tools?: ChatBody["tools"]): ConversationState {
++  resolve(messages: ParsedMessage[], tools?: ChatBody["tools"], clientSessionId?: string): ConversationState {
+     this.evictStale();
+ 
+-    const fingerprint = this.fingerprint(messages, tools);
++    const fingerprint = this.fingerprint(messages, tools, clientSessionId);
+     const existing = this.conversations.get(fingerprint);
+ 
+     if (existing) {
+@@ -221,10 +225,15 @@ export class SessionPool {
+       // already created and verified" in an empty directory — and the pass rate
+       // fell 7/10 → 4/10 → 3/10 over the sweep. The full prompt re-sends the
+       // whole history, so nothing the harness holds is lost.
+-      if (messages.length <= existing.sentMessageCount) {
+-        log.info(`Conversation ${fingerprint}: not a continuation (${messages.length} <= ${existing.sentMessageCount} sent), starting a fresh M365 conversation`);
++      const prefixChanged = existing.sentPrefixHash !== undefined &&
++        messageHash(messages.slice(0, existing.sentMessageCount)) !== existing.sentPrefixHash;
++      if (messages.length <= existing.sentMessageCount || prefixChanged || existing.contextUncertain) {
++        log.info(`Conversation ${fingerprint}: history changed, retried, or uncertain; starting a fresh M365 conversation`);
+         existing.session.newConversation();
+         existing.sentMessageCount = 0;
++        existing.sentPrefixHash = undefined;
++        existing.sentToolsKey = undefined;
++        existing.contextUncertain = false;
+         existing.pendingNote = null;
+       }
+       existing.lastAccessedAt = Date.now();
+@@ -252,10 +261,18 @@ export class SessionPool {
+   // which costs a thread, not the answer. Names, not definitions: descriptions
+   // can carry per-turn text. The system prompt would separate the title request
+   // too, but it is the likelier place for a date, a time or a git status.
+-  private fingerprint(messages: ParsedMessage[], tools?: ChatBody["tools"]): string {
++  private fingerprint(messages: ParsedMessage[], tools?: ChatBody["tools"], clientSessionId?: string): string {
+     const firstUser = messages.find(m => m.role === "user");
+     const text = firstUser ? getMessageContent(firstUser) : "";
+     const toolNames = [...new Set((tools ?? []).map(t => t.function.name))].sort().join(",");
++    if (clientSessionId) {
++      // Explicit client sessions can discover tools without losing their history.
++      // Tool-less helper requests stay separate; unscoped clients retain the
++      // legacy tool-name key below. Prefix verification guards rewritten history.
++      return createHash("sha256")
++        .update(JSON.stringify([clientSessionId, tools?.length ? "tools" : "chat", text]))
++        .digest("hex");
++    }
+     return simpleHash(`${toolNames}\n${text}`);
+   }
+ 
+@@ -282,6 +299,10 @@ function simpleHash(str: string): string {
+   return String(hash);
+ }
+ 
++function messageHash(messages: ParsedMessage[]): string {
++  return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
++}
++
+ /** Parse a tool-mode reply, with the document guard applied.
+  *
+  *  The shell-routing parser turns every ```bash block into a tool call, so a
+@@ -317,7 +338,7 @@ function parseReply(text: string, tools: Parameters<typeof parseToolCalls>[1]):
+  *  so formatToolResponse takes the tool's name and command from the assistant
+  *  `tool_calls` that issued it — every result used to be labelled
+  *  `name="unknown"` (#50). */
+-export function formatDeltaMessages(messages: ParsedMessage[], history: ParsedMessage[] = messages): string {
++export function formatDeltaMessages(messages: ParsedMessage[], history: ParsedMessage[] = messages, framingVariant?: string): string {
+   const parts: string[] = [];
+   for (const m of messages) {
+     if (m.role === "assistant") {
+@@ -328,7 +349,9 @@ export function formatDeltaMessages(messages: ParsedMessage[], history: ParsedMe
+       // Same rendering as the first turn: named for the call that produced it.
+       parts.push(formatToolResponse(m, history));
+     } else if (m.role === "system") {
+-      // Skip system messages on follow-up turns
++      // Only new messages reach this formatter. Native per-turn reminders must
++      // survive; use the same system-message rendering as the initial request.
++      parts.push(formatMessages([m], undefined, undefined, undefined, framingVariant));
+     } else {
+       parts.push(`<${m.role}>\n${getMessageContent(m)}\n</${m.role}>`);
+     }
+@@ -347,7 +370,7 @@ export async function handleChatCompletion(
+   pool: SessionPool,
+   opts: { signal?: AbortSignal } = {},
+ ): Promise<Response> {
+-  const conv = pool.resolve(body.messages, body.tools);
++  const conv = pool.resolve(body.messages, body.tools, body.user);
+   const { session } = conv;
+   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
+   const requestedModel = body.model;
+@@ -409,6 +432,20 @@ export async function handleChatCompletion(
+   // so we only need to send new messages after the first turn.
+   const isFirstTurn = session.turnCount === 0;
+   const convId = session.conversationId;
++  const reusedMessageCount = isFirstTurn ? 0 : conv.sentMessageCount;
++  const toolsKey = JSON.stringify({
++    tools: [...(body.tools ?? [])].sort((a, b) => a.function.name.localeCompare(b.function.name)),
++    choice: body.tool_choice ?? "auto",
++  });
++  let toolsUpdated = false;
++  let submittedCharacters = 0;
++  let handlerAttempts = 0;
++  function rememberRequest() {
++    conv.sentMessageCount = body.messages.length;
++    conv.sentPrefixHash = messageHash(body.messages);
++    conv.sentToolsKey = toolsKey;
++    conv.contextUncertain = opts.signal?.aborted ?? false;
++  }
+   let text: string;
+   // Images ride on the message that carries their text (core image-input.ts).
+   let inputImages: string[];
+@@ -419,7 +456,13 @@ export async function handleChatCompletion(
+   } else {
+     const newMessages = body.messages.slice(conv.sentMessageCount);
+     inputImages = imageUrls(newMessages);
+-    const delta = newMessages.length > 0 ? formatDeltaMessages(newMessages, body.messages) : "";
++    let delta = newMessages.length > 0 ? formatDeltaMessages(newMessages, body.messages, framingVariant) : "";
++    if (conv.sentToolsKey !== toolsKey) {
++      toolsUpdated = true;
++      const configuration = formatMessages([], body.tools, body.tool_choice, undefined, framingVariant);
++      delta = "The following client tool configuration replaces the previous configuration for this turn:\n" +
++        (configuration || "No client tools are available for this turn.") + "\n\n" + delta;
++    }
+     if (delta.length > 0) {
+       text = delta;
+       // Only a tool result is the thing the note corrects the model about.
+@@ -506,6 +549,9 @@ export async function handleChatCompletion(
+         // The agent overrides `tone` (forces GPT-5), so tool-less requests must
+         // skip it to reach the model the tone selects (e.g. Claude). See
+         // ModelSession.run / docs H8.6.
++        conv.contextUncertain = true;
++        handlerAttempts++;
++        submittedCharacters += text.length;
+         copilotStream = await session.run(text, model, signal, useToolAgent, inputImages, waitForBudget);
+       } catch (err: any) {
+         if (err instanceof TurnBudgetHold) return { error: turnBudgetHoldResponse(err) };
+@@ -787,7 +833,6 @@ export async function handleChatCompletion(
+     };
+     const result = await runBuffered();
+     if ("error" in result) return { kind: "error", resp: result.error };
+-    conv.sentMessageCount = body.messages.length;
+     let fullText = stopAtFabricatedResult(result.fullText);
+ 
+     log.debug("Raw response (tool mode):", trunc(fullText, 1000));
+@@ -820,7 +865,6 @@ export async function handleChatCompletion(
+         : HALLUCINATION_FORCE_PROMPT;
+       const retry = await runBuffered();
+       if ("error" in retry) return { kind: "error", resp: retry.error };
+-      conv.sentMessageCount = body.messages.length;
+       fullText = stopAtFabricatedResult(retry.fullText);
+       ({ parsed, judged } = parseReply(fullText, body.tools));
+       log.info(`After forcing retry: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
+@@ -915,18 +959,31 @@ export async function handleChatCompletion(
+     // No tools — stream deltas live (onDelta) while buffering for the retry logic.
+     const result = await runBuffered(onDelta);
+     if ("error" in result) return { kind: "error", resp: result.error };
+-    conv.sentMessageCount = body.messages.length;
+     return { kind: "text", text: result.fullText };
+   }
+   } // end produce()
+ 
+   // --- Render: JSON (non-stream) or an early-flushed SSE stream (stream) ---
+   const includeUsage = !!body.stream_options?.include_usage;
+-  const usage = () => buildUsage(lastThrottle, lastContentOrigin, lastMessageType, lastScores, lastTurnCount, lastMetering);
++  const usage = () => ({
++    ...buildUsage(lastThrottle, lastContentOrigin, lastMessageType, lastScores, lastTurnCount, lastMetering),
++    // Context reuse is observable here; provider prompt-cache accounting is not.
++    x_m365_context: {
++      initial_mode: reusedMessageCount > 0 ? "delta" : "full",
++      conversation_reused: reusedMessageCount > 0 && convId === session.conversationId,
++      conversation_hash: createHash("sha256").update(session.conversationId).digest("hex").slice(0, 20),
++      reused_messages: convId === session.conversationId ? reusedMessageCount : 0,
++      submitted_characters: submittedCharacters,
++      handler_attempts: handlerAttempts,
++      tool_configuration_updated: toolsUpdated,
++      provider_prompt_cache: "unreported",
++    },
++  });
+ 
+   if (!body.stream) {
+     const p = await produce();
+     if (p.kind === "error") return p.resp;
++    rememberRequest();
+     if (p.kind === "tools") {
+       return jsonResponse(200, {
+         id: completionId, object: "chat.completion", created, model,
+@@ -992,6 +1049,7 @@ export async function handleChatCompletion(
+       try { p = await produce(liveDelta); }
+       catch (err: any) { p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) }; }
+       clearInterval(hb);
++      if (p.kind !== "error") rememberRequest();
+       try {
+         if (p.kind === "error") {
+           let message = "upstream error";
+diff --git a/packages/proxy-lib/src/schemas.test.ts b/packages/proxy-lib/src/schemas.test.ts
+index 4e60c31..634117d 100644
+--- a/packages/proxy-lib/src/schemas.test.ts
++++ b/packages/proxy-lib/src/schemas.test.ts
+@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
+ import { ChatMessage, ChatCompletionRequest } from "./schemas";
+ 
+ describe("ChatMessage role normalization", () => {
++  it("preserves an optional opaque client session identifier", () => {
++    const request = ChatCompletionRequest.parse({
++      user: "opaque-session-key",
++      messages: [{ role: "user", content: "Inspect this project." }],
++    });
++    expect(request.user).toBe("opaque-session-key");
++  });
++
+   it("normalizes the OpenAI `developer` role to `system`", () => {
+     const msg = ChatMessage.parse({ role: "developer", content: "you are a bot" });
+     expect(msg.role).toBe("system");
+diff --git a/packages/proxy-lib/src/schemas.ts b/packages/proxy-lib/src/schemas.ts
+index eb13fb9..9962cb5 100644
+--- a/packages/proxy-lib/src/schemas.ts
++++ b/packages/proxy-lib/src/schemas.ts
+@@ -52,6 +52,8 @@ export const ChatCompletionRequest = z.object({
+   // high-variance at turn-1 tool-calling (see docs/hypotheses.md F24 + correction:
+   // magic swung 0/2 → 2/2 across probes; explicit tones pin a specific backend).
+   model: z.string().optional().default("gpt-5.5-think-deeper"),
++  // An opaque client session ID isolates otherwise identical conversation openers.
++  user: z.string().max(256).optional(),
+   messages: z.array(ChatMessage).min(1),
+   stream: z.boolean().optional().default(false),
+   // OpenAI streaming option: include_usage=true → emit a final chunk with `usage`.
+diff --git a/packages/proxy-lib/src/streaming.test.ts b/packages/proxy-lib/src/streaming.test.ts
+index c355bb2..903db42 100644
+--- a/packages/proxy-lib/src/streaming.test.ts
++++ b/packages/proxy-lib/src/streaming.test.ts
+@@ -758,6 +758,24 @@ describe("follow-up turns and give-ups (Windows / pi, measured)", () => {
+ });
+ 
+ describe("a new harness session that shares the first user message", () => {
++  it("isolates growing histories from different explicit client sessions", () => {
++    const pool = new SessionPool();
++    const opener = [{ role: "user" as const, content: "Inspect this project." }];
++    const first = pool.resolve(opener, undefined, "client-one");
++    first.sentMessageCount = 1;
++    const longer = [...opener, { role: "user" as const, content: "Continue." }];
++    const second = pool.resolve(longer, undefined, "client-two");
++    expect(second).not.toBe(first);
++    expect(pool.resolve(longer, undefined, "client-one")).toBe(first);
++    expect(pool.size).toBe(2);
++  });
++
++  it("keeps unscoped clients separate from an explicitly scoped session", () => {
++    const pool = new SessionPool();
++    const opener = [{ role: "user" as const, content: "Inspect this project." }];
++    expect(pool.resolve(opener)).not.toBe(pool.resolve(opener, undefined, "client-one"));
++  });
++
+   const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];
+   const ask = async (messages: any[], pool: InstanceType<typeof SessionPool>) =>
+     (await (await handleChatCompletion(ChatCompletionRequest.parse({ model: "gpt-5.6-think-deeper", stream: false, tools, messages }), pool)).json()).choices[0].message;
+@@ -879,6 +897,121 @@ describe("a side request that shares the session's first user message (#83)", ()
+   });
+ });
+ 
++describe("explicit client context reuse", () => {
++  const search = { type: "function", function: { name: "ToolSearch", parameters: { type: "object", properties: { query: { type: "string" } } } } };
++  const read = { type: "function", function: { name: "read_fixture", parameters: { type: "object", properties: { path: { type: "string" } } } } };
++  const post = async (pool: InstanceType<typeof SessionPool>, messages: any[], tools?: any[], model = "claude-sonnet-5") => {
++    const response = await handleChatCompletion(ChatCompletionRequest.parse({
++      user: "context-reuse-fixture", model, messages, tools, stream: false,
++    }), pool);
++    return { status: response.status, body: await response.json() };
++  };
++  afterEach(() => { scripted.queue = []; });
++
++  it("keeps a long prefix once while tools are discovered and system reminders arrive", async () => {
++    scripted.result = null;
++    scripted.texts = [];
++    scripted.newConversations = 0;
++    servedBy.length = 0;
++    scripted.queue = [{ fullText: "First response." }, { fullText: "Second response." }, { fullText: "Third response." }];
++    const pool = new SessionPool();
++    const opener = "CACHE_FIXTURE_" + "0123456789".repeat(1200);
++    const messages: any[] = [{ role: "user", content: opener }];
++    const first = await post(pool, messages, [search]);
++    messages.push({ role: "assistant", content: "First response." },
++      { role: "system", content: "Keep the current tool permissions." },
++      { role: "user", content: "Continue." });
++    const second = await post(pool, messages, [search, read]);
++    messages.push({ role: "assistant", content: "Second response." }, { role: "user", content: "Finish." });
++    const third = await post(pool, messages, [read, search]);
++    expect([first.status, second.status, third.status]).toEqual([200, 200, 200]);
++    expect(pool.size).toBe(1);
++    expect(new Set(servedBy).size).toBe(1);
++    expect(scripted.newConversations).toBe(0);
++    expect(scripted.texts[0]).toContain(opener);
++    expect(scripted.texts[1]).not.toContain(opener);
++    expect(scripted.texts[1]).toContain("read_fixture");
++    expect(scripted.texts[1]).toContain("Keep the current tool permissions.");
++    expect(scripted.texts[2]).not.toContain("read_fixture");
++    expect(second.body.usage.x_m365_context).toMatchObject({
++      initial_mode: "delta", conversation_reused: true, reused_messages: 1,
++      handler_attempts: 1, tool_configuration_updated: true, provider_prompt_cache: "unreported",
++    });
++    expect(second.body.usage.x_m365_context.submitted_characters).toBe(scripted.texts[1].length);
++    expect(second.body.usage.x_m365_context.submitted_characters).toBeLessThan(scripted.texts[0].length / 2);
++    expect(third.body.usage.x_m365_context.tool_configuration_updated).toBe(false);
++    expect(second.body.usage.prompt_tokens).toBe(0);
++    expect(second.body.usage.prompt_tokens_details).toBeUndefined();
++  });
++
++  it("rebuilds context when an earlier message changes even though history grows", async () => {
++    scripted.result = null;
++    scripted.texts = [];
++    scripted.newConversations = 0;
++    scripted.queue = [{ fullText: "First response." }, { fullText: "Second response." }];
++    const pool = new SessionPool();
++    const messages = [{ role: "system", content: "Original instructions." }, { role: "user", content: "Same opener." }];
++    await post(pool, messages);
++    const second = await post(pool, [{ role: "system", content: "Updated instructions." }, messages[1],
++      { role: "assistant", content: "First response." }, { role: "user", content: "Continue." }]);
++    expect(scripted.newConversations).toBe(1);
++    expect(scripted.texts[1]).toContain("Updated instructions.");
++    expect(scripted.texts[1]).toContain("Same opener.");
++    expect(second.body.usage.x_m365_context.conversation_reused).toBe(false);
++  });
++
++  it("keeps a tool-less helper separate from the explicitly scoped agent", async () => {
++    scripted.result = null;
++    scripted.texts = [];
++    servedBy.length = 0;
++    scripted.queue = [{ fullText: "First response." }, { fullText: "Helper response." }, { fullText: "Second response." }];
++    const pool = new SessionPool();
++    const messages = [{ role: "user", content: "Same opener." }];
++    await post(pool, messages, [search]);
++    await post(pool, messages);
++    const second = await post(pool, [...messages, { role: "assistant", content: "First response." },
++      { role: "user", content: "Continue." }], [search, read]);
++    expect(pool.size).toBe(2);
++    expect(servedBy[0]).not.toBe(servedBy[1]);
++    expect(servedBy[2]).toBe(servedBy[0]);
++    expect(second.body.usage.x_m365_context.conversation_reused).toBe(true);
++  });
++
++  it("invalidates uncertain server context after a failed follow-up", async () => {
++    scripted.result = null;
++    scripted.texts = [];
++    scripted.newConversations = 0;
++    scripted.queue = [{ fullText: "First response." },
++      { fullText: "", result: { value: "Throttled", errorCode: "PerUserThrottled" } },
++      { fullText: "Recovered response." }];
++    const pool = new SessionPool();
++    const messages = [{ role: "user", content: "Same opener." }];
++    await post(pool, messages);
++    messages.push({ role: "assistant", content: "First response." }, { role: "user", content: "Continue." });
++    expect((await post(pool, messages)).status).toBe(429);
++    messages.push({ role: "user", content: "Retry after the provider recovers." });
++    const recovery = await post(pool, messages);
++    expect(scripted.newConversations).toBe(1);
++    expect(scripted.texts[2]).toContain("Same opener.");
++    expect(recovery.body.usage.x_m365_context.conversation_reused).toBe(false);
++  });
++
++  it("rebuilds context when the selected model changes", async () => {
++    scripted.result = null;
++    scripted.texts = [];
++    scripted.newConversations = 0;
++    scripted.queue = [{ fullText: "First response." }, { fullText: "Second response." }];
++    const pool = new SessionPool();
++    const messages = [{ role: "user", content: "Same opener." }];
++    await post(pool, messages, undefined, "claude-sonnet");
++    const second = await post(pool, [...messages, { role: "assistant", content: "First response." },
++      { role: "user", content: "Continue." }], undefined, "claude-sonnet-5");
++    expect(scripted.newConversations).toBe(1);
++    expect(scripted.texts[1]).toContain("Same opener.");
++    expect(second.body.usage.x_m365_context.conversation_reused).toBe(false);
++  });
++});
++
+ describe("Opus 4.8 on an account that can't serve it (§24, §36)", () => {
+   const DEAD = { fullText: "", result: { value: "InternalError" } };
+   const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];

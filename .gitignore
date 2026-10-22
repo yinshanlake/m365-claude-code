@@ -1,0 +1,12 @@
+.local/
+.runtime/
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+*.process.json
+coverage/
+*.tgz
+Thumbs.db
+.DS_Store

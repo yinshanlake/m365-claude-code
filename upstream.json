@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/cramt/m365-copilot-proxy.git",
+  "commit": "65905e881d6597040966aff9b087aa9a908b358a",
+  "pnpmVersion": "10.32.1",
+  "patch": "patches/session-isolation.patch"
+}

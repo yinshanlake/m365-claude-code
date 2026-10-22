@@ -1,0 +1,55 @@
+{
+  "default": "gpt-5.5-think-deeper",
+  "models": [
+    {
+      "id": "gpt-5.5-think-deeper",
+      "label": "GPT 5.5 Think Deeper (M365)",
+      "description": "Default route; local file and shell check passed",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": []
+    },
+    {
+      "id": "claude-sonnet",
+      "label": "Claude Sonnet (M365)",
+      "description": "Included Sonnet route; tool requests may be refused",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": ["sonnet", "claude", "claude-sonnet-4.6", "claude-sonnet-4-6", "claude-sonnet-4.5", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]
+    },
+    {
+      "id": "claude-sonnet-5",
+      "label": "Claude Sonnet 5 route (M365)",
+      "description": "Availability depends on Microsoft 365 entitlement",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": []
+    },
+    {
+      "id": "claude-sonnet-5.5",
+      "label": "Claude Sonnet 5.5 route (M365)",
+      "description": "Paid scenario; availability and priority allowance apply",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": ["claude-sonnet-5-5"]
+    },
+    {
+      "id": "claude-opus",
+      "label": "Claude Opus route (M365)",
+      "description": "Paid Opus scenario; availability and priority allowance apply",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": ["opus", "claude-opus-5", "claude-opus-5.5", "claude-opus-5-5"]
+    },
+    {
+      "id": "claude-opus-4.8",
+      "clientModel": "m365-opus-included",
+      "label": "Claude Opus 4.8 route (M365)",
+      "description": "Included Opus scenario; requires an eligible account",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": ["claude-opus-4-8", "m365-opus-included"]
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "label": "GPT 6.1 Sol route (M365)",
+      "description": "Proxy-advertised route; agent reliability not established",
+      "behavesAs": "claude-sonnet-4-6",
+      "aliases": []
+    }
+  ]
+}

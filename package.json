@@ -1,0 +1,23 @@
+{
+  "name": "m365-claude-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run the native Claude Code CLI with Microsoft 365 Copilot through a local Anthropic-compatible gateway.",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node src/server.cjs",
+    "test": "node --test test/*.test.cjs",
+    "test:launcher": "pwsh -NoProfile -File test/launcher.tests.ps1",
+    "audit:public": "node scripts/audit-public.cjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "openai": "5.23.2",
+    "tiktoken": "1.0.22"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "0.54.0"
+  }
+}

@@ -1,0 +1,137 @@
+# M365 Claude Code
+
+Run the **real Claude Code CLI** against Microsoft 365 Copilot through a local Anthropic-compatible gateway. Use the terminal UI, files, shell tools, MCP integrations, and native permission prompts with the model routes available to your M365 account.
+
+**Giving this to an agent? Start with [AGENT_README.md](AGENT_README.md).**
+
+~~~text
+Claude Code: terminal UI, tools, MCP, permissions
+    |
+    | Anthropic Messages API
+    v
+This gateway                         127.0.0.1:4145
+    |
+    | OpenAI Chat Completions API
+    v
+cramt/m365-copilot-proxy              127.0.0.1:4144
+    |
+    | Microsoft 365 Copilot / SignalR
+    v
+The model route available to your account
+~~~
+
+The gateway translates protocols; Claude Code executes the tools. The M365 backend reconstructs tool calls from chat text, so agent behavior remains model-dependent. This is an experimental integration, with [documented compatibility limits](docs/compatibility.md).
+
+## Quick start: Windows
+
+Prerequisites: **Node.js 24+**, **PowerShell 7.4+**, **Git with Git Bash**, **Chrome**, **Claude Code 2.1.280+**, and a **work or school account with access to M365 Copilot**. Install Claude Code through its [official setup instructions](https://code.claude.com/docs/en/setup).
+
+~~~powershell
+git clone https://github.com/yinshanlake/m365-claude-code.git
+cd m365-claude-code
+pwsh -NoProfile -File .\scripts\Setup.ps1
+.\m365-claude.cmd -Model claude-sonnet
+~~~
+
+Complete Microsoft sign-in in Chrome when prompted. Your normal SSO and MFA flow stays in the browser. This setup does not request an account password or MFA seed.
+
+Setup installs the gateway dependencies, checks out the pinned upstream proxy, applies the session-isolation and context-reuse patch, and builds it. It creates a private local gateway credential and a separate Claude profile. It does not install a Windows startup task or change your normal Claude configuration.
+
+If your environment requires an approved npm mirror, pass its HTTPS URL with **-Registry**. If executables are not discoverable, provide **-ClaudePath** or **-ChromePath**.
+
+## Everyday use
+
+~~~powershell
+.\m365-claude.cmd
+.\m365-claude.cmd -Directory C:\work\my-project
+.\m365-claude.cmd -Model claude-opus-4.8
+.\m365-claude.cmd --continue
+.\m365-claude.cmd -NoMcp
+~~~
+
+Inside the session, use **/model** to choose a route. Enter saves the choice for future sessions; **s** chooses it for one session. The request's model controls routing, and unsupported models return an error. The launcher does not pin every request to a fixed model header.
+
+Native flags such as **--print**, **--verbose**, **--debug**, **--resume**, and **--continue** pass through. PowerShell's advanced parameter binding is deliberately avoided so it cannot consume native Claude flags.
+
+The launcher uses the concise prompt in [prompts/agent.md](prompts/agent.md), and keeps Claude Code responsible for tools and permissions. All built-in tools are enabled by default; **-BuiltInTools Read,Edit,Write,Bash** selects a smaller task-specific subset.
+
+## Models
+
+| Route | Purpose |
+| --- | --- |
+| claude-sonnet | Included Sonnet route |
+| claude-sonnet-5 | Sonnet 5 route; entitlement-dependent |
+| claude-sonnet-5.5 | Paid Sonnet scenario; priority allowance may apply |
+| claude-opus | Paid Opus scenario; priority allowance may apply |
+| claude-opus-4.8 | Included Opus scenario; requires an eligible account |
+| gpt-5.5-think-deeper | Default when no model is saved or explicitly selected |
+| gpt-6.1-sol | Additional proxy-advertised reasoning route |
+
+These are **upstream route aliases**, not independently verified model versions. Account entitlements still apply. The pinned backend does not advertise Fable; a Claude Code menu label cannot make it available.
+
+The Opus 4.8 picker entry uses the client alias **m365-opus-included** so this Claude Code version keeps it separate from the other Opus entry. It maps explicitly to the upstream **claude-opus-4.8** route.
+
+The small-helper alias is assigned to GPT because this backend does not advertise Haiku. The main session follows its selected model. Model definitions live in [src/models.json](src/models.json); the picker's compatibility hints do not prove Microsoft's context capacity or model identity.
+
+## Optional MCP
+
+No personal or organization-specific MCP servers are shipped. The private configuration starts empty at **.local/mcp.json**.
+
+For a fresh setup with browser tools (stop the owned services before rerunning setup):
+
+~~~powershell
+pwsh -NoProfile -File .\scripts\Setup.ps1 -McpConfig .\examples\mcp.playwright.json
+.\m365-claude.cmd
+~~~
+
+**-McpConfig** replaces the private MCP file with the file you select. Merge with your existing configuration first if you already added servers. Keys and private service endpoints belong in local configuration, not commits.
+
+The optional Playwright example uses Chrome and a normal browser session. It does not import someone else's authenticated browser profile.
+
+## Verify and manage
+
+~~~powershell
+.\m365-claude.cmd auth status --json
+pwsh -NoProfile -File .\scripts\Doctor.ps1
+pwsh -NoProfile -File .\scripts\Doctor.ps1 -Live -Model claude-sonnet
+pwsh -NoProfile -File .\scripts\Doctor.ps1 -CheckContext -Model claude-sonnet
+pwsh -NoProfile -File .\scripts\Manage.ps1 -Action Status
+pwsh -NoProfile -File .\scripts\Manage.ps1 -Action Stop
+~~~
+
+Doctor checks the gateway and compares its catalog with the real upstream model list. **-Live** makes one small inference request. **-CheckContext** makes two requests and verifies that the second reuses M365 context and recalls the first turn. Provider prompt-cache counters remain unreported; see [context reuse and quotas](docs/context-reuse.md). A successful chat alone does not verify agent tool behavior; the agent guide includes a real file-and-command check.
+
+The manager stops only processes whose PID, executable path, and start time match its records. Occupied ports are never taken over. Use **-GatewayPort** and **-UpstreamPort** during setup to choose other ports.
+
+Already running an M365 proxy? Reuse it:
+
+~~~powershell
+pwsh -NoProfile -File .\scripts\Setup.ps1 -UpstreamBaseUrl http://127.0.0.1:4144/v1
+~~~
+
+If that upstream requires an API key, place it in **.local/upstream-key.txt**. External backend processes are not managed by this repository. Their model catalog must match the routes you configure.
+
+## What the gateway handles
+
+- Explicit model routing, model discovery, and local bearer authentication.
+- Tool-call IDs, parallel results, images, deferred tool schemas, and safe handling of incomplete history.
+- Anthropic streaming events, valid JSON arguments, correct stop reasons, errors, cancellation, and timeouts.
+- Locally validated JSON-schema output and estimated token counts for client context management.
+- Separate M365 conversation state per client session, with serialized requests to respect the upstream's concurrency limits.
+
+Native Anthropic server tools, signed thinking, exact effort control, precise billing/cache accounting, and a guaranteed 1M context window are not supplied. See [compatibility details](docs/compatibility.md).
+
+## Development
+
+~~~powershell
+npm ci
+npm test
+npm run test:launcher
+npm run audit:public
+~~~
+
+The Node protocol tests run without Microsoft credentials or network inference. The launcher checks require PowerShell. CI runs the protocol suite on Windows and Linux; the automated installer is Windows-first.
+
+Private state and logs live in **.local/**. The downloaded backend lives in **.runtime/**. Both are ignored by Git; see [SECURITY.md](SECURITY.md). **M365_CLAUDE_DATA_DIR** can select a different private state directory.
+
+Built with [cramt/m365-copilot-proxy](https://github.com/cramt/m365-copilot-proxy), informed by [Agent Maestro](https://github.com/Joouis/agent-maestro). See [NOTICE.md](NOTICE.md) and [LICENSE](LICENSE).

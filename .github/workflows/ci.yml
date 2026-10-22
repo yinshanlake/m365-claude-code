@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run audit:public
+      - name: Check Windows launcher
+        if: runner.os == 'Windows'
+        run: npm run test:launcher
+
+  upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check the patch against the pinned upstream
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+          const pin = require('./upstream.json');
+          const directory = path.resolve('.runtime/upstream-ci');
+          fs.mkdirSync(path.dirname(directory), { recursive: true });
+          const git = args => execFileSync('git', args, { stdio: 'inherit' });
+          git(['clone', '--filter=blob:none', '--no-checkout', pin.repository, directory]);
+          git(['-C', directory, 'checkout', '--detach', pin.commit]);
+          git(['-C', directory, 'apply', '--check', path.resolve(pin.patch)]);
+          git(['-C', directory, 'apply', path.resolve(pin.patch)]);
+          NODE
+      - name: Install upstream dependencies
+        working-directory: .runtime/upstream-ci
+        run: npx --yes pnpm@10.32.1 install --frozen-lockfile
+      - name: Build upstream
+        working-directory: .runtime/upstream-ci
+        run: npx --yes pnpm@10.32.1 run build
+      - name: Test upstream
+        working-directory: .runtime/upstream-ci
+        run: npx --yes pnpm@10.32.1 exec vitest run
