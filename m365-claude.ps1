@@ -44,8 +44,8 @@ $environment = @{
     ANTHROPIC_DEFAULT_MODEL = $catalog.default
     ANTHROPIC_DEFAULT_SONNET_MODEL = 'claude-sonnet'
     ANTHROPIC_DEFAULT_OPUS_MODEL = 'claude-opus'
-    ANTHROPIC_DEFAULT_HAIKU_MODEL = $catalog.default
-    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME = 'M365 helper (GPT 5.5 Think Deeper)'
+    ANTHROPIC_DEFAULT_HAIKU_MODEL = $catalog.helper
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME = 'M365 helper (Claude Sonnet)'
     ANTHROPIC_DEFAULT_FABLE_MODEL = $null
     ANTHROPIC_SMALL_FAST_MODEL = $null
     ANTHROPIC_CUSTOM_MODEL_OPTION = $null
@@ -69,9 +69,11 @@ try {
         [Environment]::SetEnvironmentVariable($name, $environment[$name], 'Process')
     }
     if ($options.Directory) { Set-Location -LiteralPath $options.Directory }
+    $clientSettings = New-M365ClientSettings -DataDirectory $dataDir -Environment $environment -Arguments $nativeArguments
+    $nativeArguments = $clientSettings.NativeArguments
     $prompt = Get-Content -LiteralPath (Join-Path $repoRoot 'prompts\agent.md') -Raw
     $prompt += [Environment]::NewLine + 'Working directory: ' + (Get-Location).Path
-    $launchArguments = @('--tools', $options.BuiltInTools, '--system-prompt', $prompt)
+    $launchArguments = @('--settings', $clientSettings.Path, '--tools', $options.BuiltInTools, '--system-prompt', $prompt)
     if ($options.ModelSpecified) {
         $selected = $catalog.models | Where-Object id -EQ $options.Model
         $launchArguments += @('--model', ($selected.clientModel ?? $selected.id))
@@ -80,7 +82,14 @@ try {
     # Terminates the variadic --mcp-config option before native positional input.
     $launchArguments += '--strict-mcp-config'
     $modelLabel = if ($options.ModelSpecified) { $options.Model } else { 'saved selection or ' + $catalog.default }
-    [Console]::Error.WriteLine('M365 Claude Code | model: ' + $modelLabel + ' | gateway: ' + $config.gatewayPort)
+    [Console]::Error.WriteLine('M365 Claude Code | preferred route: ' + $modelLabel + ' | gateway: ' + $config.gatewayPort)
+    if ($clientSettings.NativeFallback) {
+        [Console]::Error.WriteLine('Fallback policy: the explicitly supplied native --fallback-model option.')
+    } elseif ($config.fallbackEnabled -eq $false) {
+        [Console]::Error.WriteLine('Fallback policy: disabled by local configuration.')
+    } else {
+        [Console]::Error.WriteLine('Fallback policy: other configured Claude routes before GPT. The response model identifies the route that answered.')
+    }
     & $claude @launchArguments @nativeArguments
     $exitCode = $LASTEXITCODE
 } finally {

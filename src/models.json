@@ -1,10 +1,12 @@
 {
-  "default": "gpt-5.5-think-deeper",
+  "default": "claude-opus",
+  "helper": "claude-sonnet",
+  "fallbackOrder": ["claude-opus", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet", "gpt-5.5-think-deeper", "gpt-6.1-sol"],
   "models": [
     {
       "id": "gpt-5.5-think-deeper",
       "label": "GPT 5.5 Think Deeper (M365)",
-      "description": "Default route; local file and shell check passed",
+      "description": "GPT fallback; local file and shell check passed",
       "behavesAs": "claude-sonnet-4-6",
       "aliases": []
     },

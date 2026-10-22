@@ -3,6 +3,7 @@
 const { randomUUID } = require('node:crypto');
 const { get_encoding } = require('tiktoken');
 const { resolveModel } = require('./route.cjs');
+const { streamError } = require('./upstream.cjs');
 const encoding = get_encoding('cl100k_base');
 const Ajv = require('ajv');
 const Ajv2020 = require('ajv/dist/2020');
@@ -351,7 +352,7 @@ async function streamMessage(stream, model, inputEstimate, emit, observeModel = 
   let usage;
   const calls = new Map();
   for await (const chunk of stream) {
-    if (chunk.error) throw problem(chunk.error.message || 'Upstream stream failed.', 502, 'api_error');
+    if (chunk.error) throw streamError(chunk.error);
     assertResponseModel(chunk.model, model);
     if (chunk.model) observeModel(chunk.model);
     if (chunk.usage) { usage = chunk.usage; observeUsage(usage); }
@@ -405,4 +406,4 @@ async function streamMessage(stream, model, inputEstimate, emit, observeModel = 
   return { stop_reason: reason, usage: finalUsage };
 }
 
-module.exports = { problem, convertRequest, estimateInput, usageOf, upstreamDiagnostics, responseMessage, streamMessage };
+module.exports = { problem, convertRequest, estimateInput, usageOf, upstreamDiagnostics, assertResponseModel, responseMessage, streamMessage };

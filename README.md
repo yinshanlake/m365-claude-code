@@ -30,7 +30,7 @@ Prerequisites: **Node.js 24+**, **PowerShell 7.4+**, **Git with Git Bash**, **Ch
 git clone https://github.com/yinshanlake/m365-claude-code.git
 cd m365-claude-code
 pwsh -NoProfile -File .\scripts\Setup.ps1
-.\m365-claude.cmd -Model claude-sonnet
+.\m365-claude.cmd
 ~~~
 
 Complete Microsoft sign-in in Chrome when prompted. Your normal SSO and MFA flow stays in the browser. This setup does not request an account password or MFA seed.
@@ -49,9 +49,13 @@ If your environment requires an approved npm mirror, pass its HTTPS URL with **-
 .\m365-claude.cmd -NoMcp
 ~~~
 
-Inside the session, use **/model** to choose a route. Enter saves the choice for future sessions; **s** chooses it for one session. The request's model controls routing, and unsupported models return an error. The launcher does not pin every request to a fixed model header.
+Inside the session, use **/model** to choose a preferred route. Enter saves the choice for future sessions; **s** chooses it for one session. Unknown routes return an error. The launcher does not pin every request to a fixed model header.
 
-Native flags such as **--print**, **--verbose**, **--debug**, **--resume**, and **--continue** pass through. PowerShell's advanced parameter binding is deliberately avoided so it cannot consume native Claude flags.
+The default preference is Opus. For a model-specific allowance exhaustion, unavailable model route, or explicit overload, the gateway tries the other configured routes in this order: **Opus, Opus 4.8, Sonnet 5.5, Sonnet 5, Sonnet, GPT 5.5 Think Deeper, GPT 6.1 Sol**. It skips the route already attempted. Authentication errors, malformed requests, account-wide throttling, and failures after output starts do not trigger this sequence.
+
+The native model picker shows your preference. The response's model field and private route logs identify what actually answered; **Doctor.ps1 -Recent** displays recent routes. Set **fallbackEnabled: false** in .local/config.json for strict routing, and restart the owned services after changing that setting. An explicitly supplied native **--fallback-model** option disables gateway fallback for that client and retains Claude Code's own behavior.
+
+Native flags such as **--print**, **--verbose**, **--debug**, **--resume**, and **--continue** pass through. PowerShell's advanced parameter binding is deliberately avoided so it cannot consume native Claude flags. User-supplied **--settings** content is preserved in a private launch settings file, with only the connector environment taking precedence. This prevents project settings, including a home-directory .claude/settings.json, from redirecting M365 requests to another gateway.
 
 The launcher uses the concise prompt in [prompts/agent.md](prompts/agent.md), and keeps Claude Code responsible for tools and permissions. All built-in tools are enabled by default; **-BuiltInTools Read,Edit,Write,Bash** selects a smaller task-specific subset.
 
@@ -62,16 +66,18 @@ The launcher uses the concise prompt in [prompts/agent.md](prompts/agent.md), an
 | claude-sonnet | Included Sonnet route |
 | claude-sonnet-5 | Sonnet 5 route; entitlement-dependent |
 | claude-sonnet-5.5 | Paid Sonnet scenario; priority allowance may apply |
-| claude-opus | Paid Opus scenario; priority allowance may apply |
+| claude-opus | Default preference; paid Opus scenario with a priority allowance |
 | claude-opus-4.8 | Included Opus scenario; requires an eligible account |
-| gpt-5.5-think-deeper | Default when no model is saved or explicitly selected |
+| gpt-5.5-think-deeper | GPT fallback after the configured Claude routes |
 | gpt-6.1-sol | Additional proxy-advertised reasoning route |
 
 These are **upstream route aliases**, not independently verified model versions. Account entitlements still apply. The pinned backend does not advertise Fable; a Claude Code menu label cannot make it available.
 
 The Opus 4.8 picker entry uses the client alias **m365-opus-included** so this Claude Code version keeps it separate from the other Opus entry. It maps explicitly to the upstream **claude-opus-4.8** route.
 
-The small-helper alias is assigned to GPT because this backend does not advertise Haiku. The main session follows its selected model. Model definitions live in [src/models.json](src/models.json); the picker's compatibility hints do not prove Microsoft's context capacity or model identity.
+The small-helper alias is assigned to the included Sonnet route because this backend does not advertise Haiku. Model definitions and fallback order live in [src/models.json](src/models.json); the picker's compatibility hints do not prove Microsoft's context capacity or model identity.
+
+This is a direct connection to the local M365 gateway and does not require Agent Maestro. It is still a protocol bridge. An official Anthropic connection requires separate Anthropic credentials and does not supply GPT models; changing a provider label cannot convert M365 access into an official Anthropic API account.
 
 ## Optional MCP
 
@@ -95,6 +101,7 @@ The optional Playwright example uses Chrome and a normal browser session. It doe
 pwsh -NoProfile -File .\scripts\Doctor.ps1
 pwsh -NoProfile -File .\scripts\Doctor.ps1 -Live -Model claude-sonnet
 pwsh -NoProfile -File .\scripts\Doctor.ps1 -CheckContext -Model claude-sonnet
+pwsh -NoProfile -File .\scripts\Doctor.ps1 -Recent
 pwsh -NoProfile -File .\scripts\Manage.ps1 -Action Status
 pwsh -NoProfile -File .\scripts\Manage.ps1 -Action Stop
 ~~~

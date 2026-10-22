@@ -1,10 +1,24 @@
 #Requires -Version 7.4
 [CmdletBinding()]
-param([switch]$Live, [switch]$CheckContext, [string]$Model = 'claude-sonnet')
+param([switch]$Live, [switch]$CheckContext, [switch]$Recent, [string]$Model = 'claude-sonnet')
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Common.ps1')
 $config = Read-M365Configuration
 $dataDir = Get-M365DataDirectory
+if ($Recent) {
+    $log = Get-ChildItem -LiteralPath (Join-Path $dataDir 'logs') -Filter 'routes-*.jsonl' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $log) { throw 'No gateway route log is available yet.' }
+    Get-Content -LiteralPath $log.FullName -Tail 1000 | ForEach-Object {
+        $entry = $_ | ConvertFrom-Json
+        if ($entry.event -eq 'complete') {
+            [pscustomobject]@{ Time = $entry.time; Requested = $entry.requested_model;
+                Actual = $entry.upstream_model; Fallback = $entry.fallback_used;
+                Attempted = ($entry.attempted_models -join ', ') }
+        }
+    } | Select-Object -Last 8 | Format-Table -Wrap
+    exit 0
+}
 $baseUrl = 'http://127.0.0.1:' + $config.gatewayPort
 $key = (Get-Content -LiteralPath (Join-Path $dataDir 'gateway-key.txt') -Raw).Trim()
 $headers = @{ Authorization = 'Bearer ' + $key }

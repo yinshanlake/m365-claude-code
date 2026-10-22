@@ -38,6 +38,6 @@ If an external upstream lacks the patch, the check reports that context telemetr
 
 ## Interpreting a limit
 
-The paid Opus and Sonnet scenarios have priority-access allowances counted per turn in the pinned upstream's measurements. The proxy's internal retries also consume turns. A 429 with an allowance reset time requires waiting for the reset or explicitly selecting another available route; context reuse does not reset the allowance.
+The paid Opus and Sonnet scenarios have priority-access allowances counted per turn in the pinned upstream's measurements. The proxy's internal retries also consume turns. With gateway fallback enabled, a model-specific priority-access exhaustion tries the other configured Claude routes before GPT. With strict routing, select another available route or wait for the reset. Account-wide throttling is reported without sweeping models. Context reuse does not reset an allowance.
 
 A cached or retained prefix still occupies context. The gateway therefore keeps estimating the full context for Claude Code's compaction decisions. Lowering that estimate to only the transmitted delta would hide context growth from the client. M365 does not expose enough information to certify a provider TPM limit, exact cache billing, or a guaranteed context window.

@@ -335,6 +335,100 @@ test('stable client metadata keeps its upstream session key as tools change', as
   assert.equal(JSON.stringify(f.traces).includes('client-a'), false);
 });
 
+test('a model-specific Opus quota falls back to another Claude and reports the actual model', async t => {
+  const f = await fixture(t, (body, res) => body.model === 'claude-opus'
+    ? json(res, { error: { message: 'Fixture priority allowance exhausted.', type: 'rate_limit_error', code: 'priority_access_exhausted' } }, 429)
+    : json(res, completion(body.model)), { fallbackModels: route.catalog.fallbackOrder });
+  const response = await f.post({ ...base, model: 'claude-opus', metadata: { user_id: 'fallback-fixture' } });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).model, 'claude-opus-4.8');
+  assert.equal(response.headers.get('x-m365-model'), 'claude-opus-4.8');
+  assert.equal(response.headers.get('x-m365-requested-model'), 'claude-opus');
+  assert.equal(response.headers.get('x-m365-fallback-used'), 'true');
+  assert.deepEqual(f.seen.map(entry => entry.body.model), ['claude-opus', 'claude-opus-4.8']);
+  assert.equal(f.seen[0].body.user, f.seen[1].body.user);
+  assert.equal(f.traces.filter(event => event.event === 'fallback').length, 1);
+});
+
+test('every configured Claude route is tried before GPT, in order', async t => {
+  const f = await fixture(t, (body, res) => body.model.startsWith('claude-')
+    ? json(res, { error: { message: 'Fixture model unavailable.', type: 'upstream_error', code: 'model_route_unavailable' } }, 502)
+    : json(res, completion(body.model)), { fallbackModels: route.catalog.fallbackOrder });
+  const response = await f.post({ ...base, model: 'claude-opus' });
+  assert.equal((await response.json()).model, 'gpt-5.5-think-deeper');
+  assert.deepEqual(f.seen.map(entry => entry.body.model), [
+    'claude-opus', 'claude-opus-4.8', 'claude-sonnet-5.5', 'claude-sonnet-5', 'claude-sonnet', 'gpt-5.5-think-deeper',
+  ]);
+});
+
+test('invalid requests, authentication failures, and account throttles do not fan out', async t => {
+  for (const [status, type, code] of [
+    [400, 'invalid_request_error', 'invalid_request_body'],
+    [401, 'authentication_error', 'invalid_api_key'],
+    [403, 'permission_error', 'access_denied'],
+    [429, 'rate_limit_error', 'm365_throttled'],
+    [429, 'rate_limit_error', undefined],
+    [502, 'upstream_empty_response', undefined],
+  ]) {
+    const f = await fixture(t, (_body, res) => json(res, { error: { message: 'Fixture failure.', type, code } }, status),
+      { fallbackModels: route.catalog.fallbackOrder });
+    assert.equal((await f.post({ ...base, model: 'claude-opus' })).status, status);
+    assert.equal(f.seen.length, 1);
+  }
+});
+
+test('streaming can change route before content without emitting a false model start', async t => {
+  const f = await fixture(t, (body, res) => body.model === 'claude-opus'
+    ? sse(res, [{ ...chunk({ role: 'assistant' }), model: body.model },
+      { error: { message: 'Fixture quota.', type: 'rate_limit_error', code: 'priority_access_exhausted' } }])
+    : sse(res, [{ ...chunk({ content: 'READY' }), model: body.model }, { ...chunk({}, 'stop'), model: body.model }]),
+    { fallbackModels: route.catalog.fallbackOrder });
+  const client = new Anthropic({ apiKey: 'local-test-only', baseURL: f.url, maxRetries: 0 });
+  const answer = await client.messages.stream({ ...base, model: 'claude-opus' }).finalMessage();
+  assert.equal(answer.model, 'claude-opus-4.8');
+  assert.equal(answer.content[0].text, 'READY');
+  assert.deepEqual(f.seen.map(entry => entry.body.model), ['claude-opus', 'claude-opus-4.8']);
+});
+
+test('a failure after visible text never starts a second model', async t => {
+  const f = await fixture(t, (body, res) => sse(res, [
+    { ...chunk({ content: 'Partial response.' }), model: body.model },
+    { error: { message: 'Fixture quota after content.', type: 'rate_limit_error', code: 'priority_access_exhausted' } },
+  ]), { fallbackModels: route.catalog.fallbackOrder });
+  const text = await (await f.post({ ...base, model: 'claude-opus', stream: true })).text();
+  assert.match(text, /Partial response/);
+  assert.match(text, /event: error/);
+  assert.equal(text.includes('event: message_stop'), false);
+  assert.equal(f.seen.length, 1);
+});
+
+test('an explicit client fallback policy disables gateway fallback', async t => {
+  const f = await fixture(t, (_body, res) => json(res, {
+    error: { message: 'Fixture quota.', type: 'rate_limit_error', code: 'priority_access_exhausted' },
+  }, 429), { fallbackModels: route.catalog.fallbackOrder });
+  const response = await f.post({ ...base, model: 'claude-opus' },
+    { headers: { ...f.headers, 'x-m365-fallback': 'off' } });
+  assert.equal(response.status, 429);
+  assert.equal(f.seen.length, 1);
+});
+
+test('unknown models fail before any fallback or upstream call', async t => {
+  const f = await fixture(t, (body, res) => json(res, completion(body.model)), { fallbackModels: route.catalog.fallbackOrder });
+  assert.equal((await f.post({ ...base, model: 'claude-fable-5-1' })).status, 400);
+  assert.equal(f.seen.length, 0);
+});
+
+test('all unavailable streaming routes end with one error and no fabricated answer', async t => {
+  const f = await fixture(t, (_body, res) => sse(res, [
+    { error: { message: 'Fixture quota.', type: 'rate_limit_error', code: 'priority_access_exhausted' } },
+  ]), { fallbackModels: route.catalog.fallbackOrder });
+  const text = await (await f.post({ ...base, model: 'claude-opus', stream: true })).text();
+  assert.equal(f.seen.length, route.catalog.fallbackOrder.length);
+  assert.match(text, /rate_limit_error/);
+  assert.equal(text.includes('event: message_start'), false);
+  assert.equal(text.includes('event: message_stop'), false);
+});
+
 test('HTTP rate limits are surfaced once without retry or default-model substitution', async t => {
   const f = await fixture(t, (_body, res) => json(res, { error: { message: 'Fixture allowance exhausted.' } }, 429, { 'retry-after': '5' }));
   const res = await f.post(base);

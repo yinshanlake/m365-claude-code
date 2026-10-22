@@ -10,7 +10,9 @@ Agent Maestro was the design reference for model resolution, request lifecycle, 
 
 ## Protocol behavior
 
-The model in each request determines the route. Known aliases are explicit; invalid models fail. The gateway checks the response's declared route and never silently substitutes GPT for a Claude selection.
+The model in each request determines the preferred route. Known aliases are explicit; invalid models fail. With fallback enabled, a model-specific quota or availability failure tries every remaining configured Claude route before GPT. The response identifies the actual model, and the trace records the complete attempt sequence. The gateway still rejects an upstream response that misidentifies the route attempted.
+
+Fallback happens before any text or tool arguments are delivered. Early SSE quota errors are handled before message_start; heartbeats keep the connection open. Once output starts, a failure is reported without switching models. Authentication failures, malformed requests, account-wide throttles, and unknown empty replies never trigger a model sweep. Explicit native --fallback-model arguments take precedence by disabling gateway fallback for that client.
 
 Tool calls and results retain their IDs. Parallel results, error markers, and images are preserved. Interleaved system messages from newer native clients retain their position and do not break tool pairing. Incomplete or ambiguous history stays historical context. Claude Code's client-side ToolSearch can return definitions as functions blocks in text; only a paired ToolSearch result can materialize those schemas.
 
@@ -22,7 +24,11 @@ The upstream patch namespaces conversation fingerprints by an opaque client sess
 
 ## Validation
 
-The extracted protocol suite contains 24 tests, including real local HTTP exchanges with the Anthropic SDK. It covers routing, interleaved system messages, model mismatch, parallel tool calls, deferred schemas, JSON output, errors, cancellation, timeouts, queued requests, and context/cache telemetry. Launcher checks cover native argument forwarding and PowerShell syntax.
+The extracted protocol suite contains 32 tests, including real local HTTP exchanges with the Anthropic SDK. It covers routing, interleaved system messages, model mismatch, parallel tool calls, deferred schemas, JSON output, errors, cancellation, timeouts, queued requests, context/cache telemetry, and ordered fallback. Launcher checks cover native argument forwarding, connection-setting precedence, retained user permissions, and PowerShell syntax.
+
+A native Claude Code 2.1.280 fixture reproduced a project setting overriding the launch environment. The private launch-settings overlay prevented that override. A second native fixture forced every Claude route to fail with a model-specific quota error: the client made no requests to the competing project endpoint, the gateway attempted all five Claude routes before GPT, and the native assistant record identified the actual GPT route. These checks used local fixture servers and consumed no M365 quota.
+
+A live native-client routing check on October 22, 2026 launched from a directory with competing project settings. The request reached the direct M365 gateway, received priority_access_exhausted for claude-opus, and completed through claude-opus-4.8 with the expected reply. The gateway trace and native assistant record agreed on the actual route. This was a chat-only routing check, not a tool reliability or provider cache test.
 
 The upstream patch was built and tested against the pinned revision; 81 related tests passed. The full upstream suite on Windows had 421 passing tests, six skipped tests, and two failures in unchanged tests that assume POSIX absolute paths (log.test.ts and turn-budget.test.mjs). CI also runs the full upstream suite on Linux.
 

@@ -1,5 +1,6 @@
 #Requires -Version 7.4
 $script:M365RepositoryRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'Client.ps1')
 
 function Get-M365RepositoryRoot { $script:M365RepositoryRoot }
 

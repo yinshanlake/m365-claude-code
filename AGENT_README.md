@@ -25,12 +25,14 @@ To reuse an existing backend instead of downloading one, provide **-UpstreamBase
 ## 3. Start and authenticate
 
 ~~~powershell
-.\m365-claude.cmd -Model claude-sonnet
+.\m365-claude.cmd
 ~~~
 
 Let the user complete Microsoft SSO/MFA in Chrome when required. Do not ask them to paste passwords, MFA seeds, cookies, or token caches into chat.
 
 The client authenticates to the loopback gateway through ANTHROPIC_AUTH_TOKEN. It does not need a separate Claude account login for this gateway. The dedicated profile initializes local-gateway onboarding; workspace trust and tool approvals remain native.
+
+The launcher pins connection variables through a private --settings file, so a project cannot silently reroute it to Agent Maestro or another provider. Keep native permissions and unrelated project settings intact. Opus is the default preference; eligible model failures try every other configured Claude route before GPT. Official Anthropic access is a separate account/API configuration.
 
 ## 4. Verify before declaring success
 
@@ -39,9 +41,10 @@ The client authenticates to the loopback gateway through ANTHROPIC_AUTH_TOKEN. I
 pwsh -NoProfile -File .\scripts\Doctor.ps1
 pwsh -NoProfile -File .\scripts\Doctor.ps1 -Live -Model claude-sonnet
 pwsh -NoProfile -File .\scripts\Doctor.ps1 -CheckContext -Model claude-sonnet
+pwsh -NoProfile -File .\scripts\Doctor.ps1 -Recent
 ~~~
 
-The context check makes two inference requests; use it to verify real conversation reuse, not provider prompt-cache billing. Also exercise an interactive session: open **/model**, select a configured route, and make a request. Inspect private route metadata to confirm the requested and forwarded model. Do not use the model's self-description as proof.
+The context check makes two inference requests; use it to verify real conversation reuse, not provider prompt-cache billing. Also exercise an interactive session: open **/model**, select a configured route, and make a request. Inspect the actual response model and private route metadata, including fallback attempts. The picker displays the preferred route. Do not use the model's self-description as proof.
 
 For an agent check, create a scratch directory under .local/, with a random nonce and numbers in an input file. Ask Claude Code to read the file, write the nonce and sum to a result file, and run a local verification script. Check the actual file and command output. A prose claim that a task is done is not sufficient.
 
